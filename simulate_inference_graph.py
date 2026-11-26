@@ -123,6 +123,17 @@ class DecodeGraph(Graph):
         Returns:
             Tuple of (total_decode_time, list_of_decode_samples)
         """
+
+
+        settings = getattr(self.model_config, "project_param", {}) or {}
+
+        if settings.get("block_diffusion", False):
+            return self._build_block_decode_graph(
+                block_size=settings.get("block_size", 8),
+                rounds=settings.get("rounds", 4),
+                final_kv_pass=settings.get("final_kv_pass", True),
+            )
+
         # Determine decode steps we actually simulate
         sample_points = self._generate_sample_points()
 
@@ -339,6 +350,107 @@ class DecodeGraph(Graph):
         return flag.strip().lower() not in {"", "0", "false", "no"}
 
 
+    def _build_block_decode_graph(
+        self, *, block_size, rounds, final_kv_pass=True
+    ):
+        """Execute and sum every call in the block schedule."""
+        import csv
+        import math
+        from pathlib import Path
+
+        schedule = generate_block_schedule(
+            prompt_length=self.config.seq_len,
+            output_length=self.config.decode_len,
+            block_size=block_size,
+            rounds=rounds,
+            final_kv_pass=final_kv_pass,
+        )
+
+        samples = []
+
+        for row in schedule:
+            q = row["query_tokens"]
+            total_kv = row["total_kv_length"]
+
+            shapes = llm_util.process_decode_gemm_shapes(
+                self,
+                batch_size=self.config.batch_size,
+                current_seq_len=total_kv,
+                d_model=self.config.hidden_dim,
+                num_heads=self.config.num_heads,
+                kv_heads=self.config.kv_heads,
+                intermediate_size=(
+                    self.moe_intermediate_size
+                    if self.use_moe
+                    else self.config.intermediate_size
+                ),
+                vocab_size=self.config.vocab_size,
+                model_type=self.model_config.model_config.model_type,
+                query_tokens=q,
+            )
+
+            call_time, call_energy = self._execute_decode_step(
+                step_id=row["call_id"],
+                total_seq_len=total_kv,
+                gemm_shapes=shapes,
+                query_tokens=q,
+            )
+
+            if not math.isfinite(call_time) or call_time <= 0:
+                raise RuntimeError(
+                    "Decode call time must be finite and positive."
+                )
+
+            if not math.isfinite(call_energy) or call_energy < 0:
+                raise RuntimeError(
+                    "Decode call energy must be finite and nonnegative."
+                )
+
+            row["execution_time_s"] = float(call_time)
+            row["execution_energy_j"] = float(call_energy)
+
+            samples.append(
+                DecodeSample(
+                    step_id=row["call_id"],
+                    current_seq_len=total_kv,
+                    execution_time=call_time,
+                    execution_energy=call_energy,
+                    graph_root=None,
+                    kv_cache_tokens=total_kv,
+                )
+            )
+
+        total_time = math.fsum(
+            row["execution_time_s"] for row in schedule
+        )
+        total_energy = math.fsum(
+            row["execution_energy_j"] for row in schedule
+        )
+
+        self.block_schedule = schedule
+        self.decode_model_calls = len(schedule)
+
+        destination = Path("output/LLM/block_decode_calls.csv")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        with destination.open("w", newline="") as file:
+            writer = csv.DictWriter(
+                file, fieldnames=list(schedule[0])
+            )
+            writer.writeheader()
+            writer.writerows(schedule)
+
+        print(
+            f"[block decode] calls={len(schedule)}, "
+            f"time={total_time:.8f}s, "
+            f"energy={total_energy:.8f}J"
+        )
+        print(f"Call log saved to: {destination}")
+
+        return total_time, total_energy, samples
+
+
+
 
 class InferenceEngine:
     """
@@ -396,3 +508,62 @@ class InferenceEngine:
         )
 
         return self.decode_graph.build_decode_graph()
+
+
+def generate_block_schedule(
+    prompt_length,
+    output_length,
+    block_size,
+    rounds,
+    *,
+    final_kv_pass=True,
+):
+    """Generate logical calls with a fixed prefix within each block."""
+
+    values = {
+        "prompt_length": prompt_length,
+        "output_length": output_length,
+        "block_size": block_size,
+        "rounds": rounds,
+    }
+
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer.")
+
+        minimum = 0 if name == "prompt_length" else 1
+        if value < minimum:
+            raise ValueError(f"{name} must be at least {minimum}.")
+
+    if not isinstance(final_kv_pass, bool):
+        raise ValueError("final_kv_pass must be a boolean.")
+
+    schedule = []
+    calls_per_block = rounds + int(final_kv_pass)
+
+    for block_index, start in enumerate(
+        range(0, output_length, block_size)
+    ):
+        query_tokens = min(block_size, output_length - start)
+        prefix_length = prompt_length + start
+        total_kv_length = prefix_length + query_tokens
+
+        for call_index in range(calls_per_block):
+            is_final_call = call_index == calls_per_block - 1
+            is_refinement = call_index < rounds
+
+            schedule.append({
+                "call_id": len(schedule),
+                "block_id": block_index,
+                "phase": "refine" if is_refinement else "final_kv",
+                "round_id": call_index if is_refinement else None,
+                "prefix_length": prefix_length,
+                "query_tokens": query_tokens,
+                "total_kv_length": total_kv_length,
+                "prefix_after_call": (
+                    total_kv_length if is_final_call else prefix_length
+                ),
+            })
+
+    return schedule
+

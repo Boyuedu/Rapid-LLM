@@ -86,6 +86,7 @@ class MemoryEstimator:
         gemm_shapes: Optional[Dict[str, Any]] = None,
         kv_cache_tokens: Optional[int] = None,
         zero3_ephemeral_peak_bytes: Optional[float] = None,
+        flash_attention_override: Optional[bool] = None,
     ) -> Dict[str, Any]:
         tc = self.time_calc
         precision = tc.precision
@@ -100,6 +101,8 @@ class MemoryEstimator:
         moe_group = ep
         zero_stage = int(getattr(tc, "zero_stage", 0) or 0)
         flash_attention = bool(getattr(tc, "flash_attention", False))
+        if flash_attention_override is not None:
+            flash_attention = flash_attention_override
         full_recomputation = bool(getattr(tc, "full_recomputation", False))
         use_moe = bool(getattr(tc, "use_moe", False))
         disable_embedding_unembedding = bool(

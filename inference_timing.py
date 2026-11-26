@@ -138,7 +138,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         mla_decode = str(getattr(self, "attention_type", "mha")).lower() == "mla" and run_type == "inference"
 
 
-        output_seq_len = 1  # tokens per decode call; query_tokens (H2) is threaded but unused
+        output_seq_len = query_tokens
 
         transformer_timings: Dict[str, OperationTiming] = {}
 
@@ -660,7 +660,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             moe_node_breakdown=moe_node_breakdown,
             moe_transformer_timings=moe_transformer_timings,
             batch_size=batch_size,
-            seq_len=1,
+            seq_len=query_tokens,
             hidden_dim=self.hidden_dim,
             intermediate_size=self.intermediate_size,
             vocab_size=self.vocab_size,
@@ -727,7 +727,15 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
 
 
 
-    def calc_time(self) -> Tuple[float, float]:
+    def calc_time(self, *, decode_query_tokens: int = 1) -> Tuple[float, float]:
+        if (
+            isinstance(decode_query_tokens, bool)
+            or not isinstance(decode_query_tokens, int)
+            or decode_query_tokens < 1
+        ):
+            raise ValueError("decode_query_tokens must be a positive integer.")
+        if self.model.decode_len > 0 and decode_query_tokens > self.model.decode_len:
+            raise ValueError("decode_query_tokens exceeds the output length.")
         batch_size = self._effective_transformer_batch()
         vocab_size = self.vocab_size
         hidden_dim = self.hidden_dim
@@ -896,7 +904,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
                 intermediate_size=self.moe_intermediate_size if self.use_moe else intermediate_size,
                 vocab_size=vocab_size,
                 model_type=self.model_type,
-                query_tokens=1,  # H2: tokens per decode call for the decode memory peak
+                query_tokens=decode_query_tokens,
             )
             (
                 decode_pipeline_graph,
@@ -914,7 +922,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
                 batch_size=batch_size,
                 total_seq_len=self.seq_len,
                 gemm_shapes=decode_gemm_shapes,
-                query_tokens=1,
+                query_tokens=decode_query_tokens,
             )
             decode_dispatcher = LLMExecutionDispatcher(
                 time_calc=self,
@@ -932,9 +940,10 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             decode_memory_data = mem_estimator.build_memory_data(
                 mode="inference",
                 batch_size=batch_size,
-                seq_len=1,
+                seq_len=decode_query_tokens,
                 gemm_shapes=decode_gemm_shapes,
                 kv_cache_tokens=self.seq_len,
+                flash_attention_override=False if decode_query_tokens > 1 else None,
             )
             original_pipeline_graph = self.pipeline_graph
             try:
@@ -948,6 +957,8 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             finally:
                 self.pipeline_graph = original_pipeline_graph
 
+        self.memory_prefill_peak_gib = prefill_peak_gb
+        self.memory_decode_peak_gib = decode_peak_gb
         max_peak_gb = max(prefill_peak_gb, decode_peak_gb)
         self.memory_peak_gb = max_peak_gb
 
@@ -1050,6 +1061,11 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         Returns:
             dict: Breakdown of inference timing components
         """
+
+
+        if self.project_param.get("block_diffusion", False):
+            return self._calc_block_inference_statistics()
+
         # Calculate prefill time (existing functionality)
         prefill_time, prefill_energy = self.calc_time()
         # Calculate decode time (new functionality)
@@ -1186,6 +1202,282 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             "midpoint_step": mid_step,
             "overall": overall_rate,
         }
+
+
+    def _calc_block_inference_statistics(self):
+        """Summarize fixed-block inference on one GPU."""
+        import json
+        import math
+        from pathlib import Path
+        from simulate_inference_graph import generate_block_schedule
+
+        settings = self.project_param
+        output_length = self.model.decode_len
+        prompt_length = self.seq_len - output_length
+
+        schedule = generate_block_schedule(
+            prompt_length=prompt_length,
+            output_length=output_length,
+            block_size=settings.get("block_size", 8),
+            rounds=settings.get("rounds", 4),
+            final_kv_pass=settings.get("final_kv_pass", True),
+        )
+
+        if (
+            self.use_moe
+            or any(
+                getattr(self, axis, 1) != 1
+                for axis in ("tp", "pp", "cp", "dp")
+            )
+            or getattr(self, "replica_count", 1) != 1
+            or getattr(self, "attention_type", "mha") == "mla"
+        ):
+            raise NotImplementedError(
+                "This statistics path supports the single-GPU dense model."
+            )
+
+        if getattr(self, "disable_kv_cache", False):
+            raise ValueError("Block diffusion requires KV caching.")
+
+        prefill_time, prefill_energy = self.calc_time(
+            decode_query_tokens=schedule[0]["query_tokens"]
+        )
+        prefill_peak = self.memory_prefill_peak_gib
+
+        decode_time, decode_energy, samples = self.calc_decode_time()
+
+        if len(samples) != len(schedule):
+            raise RuntimeError(
+                "Decode calls do not match the block schedule."
+            )
+
+        blocks = []
+
+        for row, sample in zip(schedule, samples):
+            if sample.current_seq_len != row["total_kv_length"]:
+                raise RuntimeError(
+                    "Decode context does not match the schedule."
+                )
+
+            if not blocks or blocks[-1]["id"] != row["block_id"]:
+                blocks.append({
+                    "id": row["block_id"],
+                    "q": row["query_tokens"],
+                    "kv": row["total_kv_length"],
+                    "times": [],
+                })
+
+            blocks[-1]["times"].append(sample.execution_time)
+
+        for block in blocks:
+            block["time"] = math.fsum(block["times"])
+
+        batch = self._effective_transformer_batch()
+        estimator = MemoryEstimator(self)
+        decode_peak = 0.0
+
+        for block in blocks:
+            q = block["q"]
+            total_kv = block["kv"]
+
+            graphs, _ = self.prepare_decode_graphs(
+                batch_size=batch,
+                total_seq_len=total_kv,
+                query_tokens=q,
+            )
+
+            (
+                pipeline,
+                root,
+                _,
+                _,
+                transformer,
+                forward,
+                backward,
+                moe,
+                moe_forward,
+                moe_backward,
+                interconnect,
+            ) = graphs
+
+            dispatcher = LLMExecutionDispatcher(
+                time_calc=self,
+                pipeline_graph=pipeline,
+                pipeline_root=root,
+                interconnect_params=interconnect,
+                transformer_graph=transformer,
+                transformer_forward_root=forward,
+                transformer_backward_root=backward,
+                moe_transformer_graph=moe,
+                moe_transformer_forward_root=moe_forward,
+                moe_transformer_backward_root=moe_backward,
+            )
+
+            shapes = llm_util.process_decode_gemm_shapes(
+                self,
+                batch_size=batch,
+                current_seq_len=total_kv,
+                d_model=self.hidden_dim,
+                num_heads=self.num_heads,
+                kv_heads=self.kv_heads,
+                intermediate_size=self.intermediate_size,
+                vocab_size=self.vocab_size,
+                model_type=self.model_type,
+                query_tokens=q,
+            )
+
+            memory_data = estimator.build_memory_data(
+                mode="inference",
+                batch_size=batch,
+                seq_len=q,
+                gemm_shapes=shapes,
+                kv_cache_tokens=total_kv,
+                flash_attention_override=False if q > 1 else None,
+            )
+
+            previous_graph = self.pipeline_graph
+
+            try:
+                self.pipeline_graph = pipeline
+
+                _, peak = estimator.simulate_peak(
+                    dispatcher.build_flattened_root_for_memory(),
+                    memory_data,
+                    mode="inference",
+                    filename=f"memory_graph_block_{block['id']:04d}",
+                )
+            finally:
+                self.pipeline_graph = previous_graph
+
+            decode_peak = max(decode_peak, peak)
+
+        overall_peak = max(prefill_peak, decode_peak)
+        capacity = float(self.DRAM.size) / (1024 ** 3)
+
+        self.memory_prefill_peak_gib = prefill_peak
+        self.memory_decode_peak_gib = decode_peak
+        self.memory_peak_gb = overall_peak
+        self.memory_capacity_per_device_gb = capacity
+        self.memory_headroom_gb = capacity - overall_peak
+        self.memory_capacity_exceeded = overall_peak > capacity
+        self.memory_capacity_violation_gb = max(
+            0.0, overall_peak - capacity
+        )
+
+        head_dim = getattr(self, "head_dim", None)
+        if head_dim is None:
+            head_dim = self.hidden_dim // self.num_heads
+
+        token_bytes = llm_util.attention_kv_cache_token_bytes(
+            getattr(self, "attention_type", "mha"),
+            batch_size=batch,
+            kv_heads=self.kv_heads,
+            head_dim=head_dim,
+            precision_bytes=self.precision.kv_cache,
+        ) * self.num_layers
+
+        prefix_reads = token_bytes * sum(
+            row["prefix_length"] for row in schedule
+        )
+
+        recomputed_kv = token_bytes * sum(
+            row["query_tokens"] for row in schedule
+        )
+
+        def rate_at(position):
+            consumed = 0
+
+            for block in blocks:
+                if position < consumed + block["q"]:
+                    return block["q"] / block["time"]
+                consumed += block["q"]
+
+            raise ValueError("Output position is out of range.")
+
+        result = {
+            "prefill_time": prefill_time,
+            "decode_time": decode_time,
+            "total_inference_time": prefill_time + decode_time,
+            "time_to_first_token": prefill_time + blocks[0]["time"],
+            "prefill_energy_j": prefill_energy,
+            "decode_energy_j": decode_energy,
+            "total_energy_j": prefill_energy + decode_energy,
+            "decode_model_calls": len(schedule),
+            "num_blocks": len(blocks),
+            "batch_size": batch,
+            "prompt_length": prompt_length,
+            "output_length": output_length,
+            "block_size": settings.get("block_size", 8),
+            "rounds": settings.get("rounds", 4),
+            "final_kv_pass": settings.get("final_kv_pass", True),
+            "average_decode_throughput": (
+                batch * output_length / decode_time
+            ),
+            "decode_tokens_per_s": {
+                "start": rate_at(0),
+                "midpoint": rate_at(output_length // 2),
+                "end": rate_at(output_length - 1),
+                "midpoint_step": output_length // 2,
+                "overall": output_length / decode_time,
+            },
+            "kv_cache_prefill_store_bytes": (
+                token_bytes * prompt_length
+            ),
+            "kv_cache_decode_store_bytes": (
+                token_bytes * output_length
+            ),
+            "kv_cache_decode_fetch_bytes": prefix_reads,
+            "decode_recomputed_kv_bytes": recomputed_kv,
+            "prefill_peak_gib": prefill_peak,
+            "decode_peak_gib": decode_peak,
+            "peak_memory_gib": overall_peak,
+            "memory_capacity_gib": capacity,
+            "memory_capacity_exceeded": overall_peak > capacity,
+            "ttft_policy": (
+                "emit the first block after its final configured call"
+            ),
+            "rates_policy": "per-request block-amortized rates",
+            "kv_traffic_policy": (
+                "logical KV payload, not physical DRAM traffic; "
+                "prefix read once per call; final output KV committed once"
+            ),
+            "final_kv_policy": (
+                "same full-forward cost as a refinement call"
+            ),
+        }
+
+        destination = Path(self.output_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+
+        (destination / "block_diffusion_summary.json").write_text(
+            json.dumps(result, indent=2) + "\n"
+        )
+
+        memory_dir = destination / "memory-summary"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+
+        (memory_dir / "memory_capacity_comparison.txt").write_text(
+            "Simulation mode: inference (block diffusion)\n"
+            f"Hardware memory capacity (per gpu): {capacity:.2f} GiB\n"
+            f"Prefill peak memory usage (per gpu): {prefill_peak:.2f} GiB\n"
+            f"Maximum decode peak memory usage (per gpu): {decode_peak:.2f} GiB\n"
+            f"Max peak memory usage (per gpu): {overall_peak:.2f} GiB\n"
+            f"Remaining memory headroom: {capacity - overall_peak:.2f} GiB\n"
+        )
+
+        print(
+            f"[block summary] calls={len(schedule)}, "
+            f"total={result['total_inference_time']:.8f}s, "
+            f"TTFT={result['time_to_first_token']:.8f}s"
+        )
+        print(
+            "Average decode throughput: "
+            f"{result['average_decode_throughput']:.4f} tokens/s"
+        )
+        print(f"Peak memory: {overall_peak:.8f} GiB")
+
+        return result
+
 
 
 
